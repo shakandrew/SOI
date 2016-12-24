@@ -22,25 +22,23 @@ typedef int bool;
 
 typedef struct shfifo
 {
-    int size;
-    int head;
-    int tail;
-    bool read_c;
-    bool read_a; // was head item read by readerA? TRUE at start in order for producer to set it to FALSE
-    bool read_b; // like above
-    bool first;
+    int size;//queue size
+    int head;//where is our head
+    int tail;//where is our tail
+    bool first;//has already somebody read this letter for first time?
  } SharedFifo;
 
 typedef struct fifo
 {
     SharedFifo* sf;
     int* buf;
-    sem_t* empty;
-    sem_t* full; // prevents producer from overflowing the buffer
-    sem_t* mutex; // main critical section
-    sem_t* a_sem; // upped when readerA has a new item to read from head
-    sem_t* b_sem; // as above
-    sem_t* c_sem; // upped when consumer has an item to eat that was read by at least one reader
+    sem_t* empty;//free places to push new letters
+    sem_t* full;//can we pop sth
+    sem_t* mutex;//critical section
+    sem_t* a_sem;//Can A read new letter
+    sem_t* b_sem;//  ----//----
+    sem_t* c_sem;//  ----//----
+    sem_t* ac_block;//semaphore to create an atomic section
 } Fifo;
 
 // initialize shared variables
@@ -50,9 +48,6 @@ void init_shfifo(void* adr, int size)
     sf->size = _size;
     sf->head = 0;
     sf->tail = 0;
-    sf->read_a = false;
-    sf->read_b = false;
-    sf->read_c = false;
     sf->first = true;
 }
 
@@ -61,22 +56,22 @@ Fifo get_fifo(void* adr)
     Fifo mem;int temp;
     // local mapping to shared memory
     mem.sf = (SharedFifo*)adr;
-    mem.buf = (int*)(mem.sf + 1); // right after SharedFifo in memory
-    // open semaphores
-    mem.empty = get_semaphore("/t3empty", mem.sf->size);
-    mem.full = get_semaphore("/t3full", 0);
-    mem.mutex = get_semaphore("/t3mutex", 1);
-    mem.a_sem = get_semaphore("/t3a_sem", 1);
-    mem.b_sem = get_semaphore("/t3b_sem", 1);
-    mem.c_sem = get_semaphore("/t3c_sem", 1);
-    //sem_getvalue(mem.empty, &temp); printf("x %d %d\n",temp, mem.sf->size);
+    mem.buf = (int*)(mem.sf + 1);
+    //semaphores initialization
+    mem.empty = get_semaphore("empty", mem.sf->size);
+    mem.full = get_semaphore("/full", 0);
+    mem.mutex = get_semaphore("mutex", 1);
+    mem.a_sem = get_semaphore("a_sem", 1);
+    mem.b_sem = get_semaphore("b_sem", 1);
+    mem.c_sem = get_semaphore("c_sem", 1);
+    mem.ac_block = get_semaphore("ac_block", 1);
     return mem;
 }
 
 void RandomSleep()
 {
     int x;
-    x = (1000 + rand()%100)*5000;
+    x = ( rand()%10000)*500;
     usleep(x);
 }
 
@@ -89,20 +84,20 @@ char RandomLetter()
 
 void cleanup()
 {
-    sem_unlink("/t3full");
-    sem_unlink("/t3mutex");
-    sem_unlink("/t3a_sem");
-    sem_unlink("/t3b_sem");
-    sem_unlink("/t3c_sem");
-    sem_unlink("/t3empty");
+    sem_unlink("full");
+    sem_unlink("mutex");
+    sem_unlink("a_sem");
+    sem_unlink("b_sem");
+    sem_unlink("c_sem");
+    sem_unlink("empty");
+    sem_unlink("ac_block");
 
-    shm_unlink("/t3shmem");
+    shm_unlink("shmem");
 }
 
-void Read(bool *flag, char name, bool met_time, Fifo * m) // flag - flag to change | name - consument name, val - value to read |first_time - first time read the letter
+void Read(char name, bool met_time, Fifo * m) //flag - flag to change | name - consument name, val - value to read |first_time - first time read the letter
 {
     char val;
-    *flag = 1;
     printf("Consumer %c read letter ", name);
     if (met_time)
     {
@@ -120,7 +115,7 @@ void Read(bool *flag, char name, bool met_time, Fifo * m) // flag - flag to chan
 void producer()
 {
     int temp=0,i;
-    Fifo mem = get_fifo(get_shared_mem("/t3shmem", memsizefor(_size)));
+    Fifo mem = get_fifo(get_shared_mem("shmem", memsizefor(_size)));
     char letter;
     while (temp!=100)
     {
@@ -145,111 +140,107 @@ void producer()
 
 void consumer_a()
 {
-    Fifo mem = get_fifo(get_shared_mem("/t3shmem", memsizefor(_size)));
+    Fifo mem = get_fifo(get_shared_mem("shmem", memsizefor(_size)));
     while(true)
     {
         RandomSleep();
+
+        sem_wait(mem.ac_block);
+            sem_wait(mem.a_sem);
+            sem_wait(mem.c_sem);
+        sem_post(mem.ac_block);
+
         sem_wait(mem.full);
         sem_wait(mem.mutex);
-        if (mem.sf->read_c)
-        {
-            sem_post(mem.mutex);
-            sem_post(mem.full);
-            continue;
-        }
+
         if (mem.sf->first)
         {
-            Read(&mem.sf->read_a, 'A', 1, &mem);
+            Read('A', 1, &mem);
             mem.sf->first = false;
             sem_post(mem.mutex);
             sem_post(mem.full);
-
-            mem.sf->read_a = true;
-            sem_wait(mem.a_sem);
         }
         else
         {
-            Read(&mem.sf->read_a, 'A', 0, &mem);
+            Read('A', 0, &mem);
             mem.sf->first = true;
+
             sem_post(mem.mutex);
             sem_post(mem.empty);
 
-            if (mem.sf->read_a){mem.sf->read_a=false;sem_post(mem.a_sem);}
-            if (mem.sf->read_b){mem.sf->read_b=false;sem_post(mem.b_sem);}
-            if (mem.sf->read_c){mem.sf->read_c=false;sem_post(mem.c_sem);}
+            sem_post(mem.a_sem);
+            sem_post(mem.b_sem);
+            sem_post(mem.c_sem);
         }
     }
 }
 
 void consumer_b()
 {
-    Fifo mem = get_fifo(get_shared_mem("/t3shmem", memsizefor(_size)));
+    Fifo mem = get_fifo(get_shared_mem("shmem", memsizefor(_size)));
     while(true)
     {
         RandomSleep();
 
+        sem_wait(mem.b_sem);
         sem_wait(mem.full);
         sem_wait(mem.mutex);
 
         if (mem.sf->first)
         {
-            Read(&mem.sf->read_b, 'B', 1, &mem);
+            Read('B', 1, &mem);
             mem.sf->first = false;
             sem_post(mem.mutex);
             sem_post(mem.full);
 
-            mem.sf->read_b = true;
-            sem_wait(mem.b_sem);
         }
         else
         {
-            Read(&mem.sf->read_b, 'B', 0, &mem);
+            Read('B', 0, &mem);
             mem.sf->first = true;
             sem_post(mem.mutex);
             sem_post(mem.empty);
 
-            if (mem.sf->read_a){mem.sf->read_a=false;sem_post(mem.a_sem);}
-            if (mem.sf->read_b){mem.sf->read_b=false;sem_post(mem.b_sem);}
-            if (mem.sf->read_c){mem.sf->read_c=false;sem_post(mem.c_sem);}
+            sem_post(mem.a_sem);
+            sem_post(mem.b_sem);
+            sem_post(mem.c_sem);
         }
     }
 }
 
 void consumer_c()
 {
-    Fifo mem = get_fifo(get_shared_mem("/t3shmem", memsizefor(_size)));
+    Fifo mem = get_fifo(get_shared_mem("shmem", memsizefor(_size)));
     while(true)
     {
         RandomSleep();
 
+        sem_wait(mem.ac_block);
+            sem_wait(mem.c_sem);
+            sem_wait(mem.a_sem);
+        sem_post(mem.ac_block);
+
         sem_wait(mem.full);
         sem_wait(mem.mutex);
-        if (mem.sf->read_a)
-        {
-            sem_post(mem.mutex);
-            sem_post(mem.full);
-            continue;
-        }
+
         if (mem.sf->first)
         {
-            Read(&mem.sf->read_c, 'C', 1, &mem);
+            Read('C', 1, &mem);
             mem.sf->first = false;
             sem_post(mem.mutex);
             sem_post(mem.full);
 
-            mem.sf->read_c = true;
-            sem_wait(mem.c_sem);
         }
         else
         {
-            Read(&mem.sf->read_c, 'C', 0, &mem);
+            Read('C', 0, &mem);
             mem.sf->first = true;
             sem_post(mem.mutex);
             sem_post(mem.empty);
 
-            if (mem.sf->read_a){mem.sf->read_a=false;sem_post(mem.a_sem);}
-            if (mem.sf->read_b){mem.sf->read_b=false;sem_post(mem.b_sem);}
-            if (mem.sf->read_c){mem.sf->read_c=false;sem_post(mem.c_sem);}
+            sem_post(mem.a_sem);
+            sem_post(mem.b_sem);
+            sem_post(mem.c_sem);
         }
     }
 }
@@ -264,7 +255,7 @@ int main()
     int k = 0;
     srandom(seed);
 
-    init_shfifo(get_shared_mem("/t3shmem", memsizefor(_size)), _size);
+    init_shfifo(get_shared_mem("shmem", memsizefor(_size)), _size);
 
     pid = fork();
     if (pid==0)
